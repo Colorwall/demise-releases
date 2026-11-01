@@ -1,0 +1,127 @@
+name: Auto Release Demise Client
+
+on:
+  schedule:
+    # check for version changes every 30 minutes automatically
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'force build release even if tag exists'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [ "main", "master" ]
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-release:
+    name: Check Version and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      # checkout the target repository source code from organization repo
+      - name: Checkout Demise Overruled
+        uses: actions/checkout@v4
+        with:
+          repository: LaxentaInc/Demise-overruled
+          ref: main
+
+      # inspect version file and compare against existing releases in this repo
+      - name: Check version.md
+        id: version_check
+        run: |
+          # read version string and strip whitespace
+          if [ -f .github/workflows/version.md ]; then
+            VERSION=$(cat .github/workflows/version.md | tr -d '[:space:]')
+          elif [ -f version.md ]; then
+            VERSION=$(cat version.md | tr -d '[:space:]')
+          else
+            echo "error: version file not found in repository"
+            exit 1
+          fi
+
+          echo "detected version: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+
+          # check if release already exists in this repository
+          if gh release view "v$VERSION" > /dev/null 2>&1; then
+            if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
+              echo "release_exists=false" >> $GITHUB_OUTPUT
+              echo "force build requested. rebuilding existing release."
+            else
+              echo "release_exists=true" >> $GITHUB_OUTPUT
+              echo "version v$VERSION is already released. skipping build."
+            fi
+          else
+            echo "release_exists=false" >> $GITHUB_OUTPUT
+            echo "new version v$VERSION detected! proceeding with build."
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # provision java 17 runtime when building
+      - name: Set up JDK 17
+        if: steps.version_check.outputs.release_exists == 'false'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      # ensure gradlew execution permissions
+      - name: Grant execute permission for gradlew
+        if: steps.version_check.outputs.release_exists == 'false'
+        run: chmod +x gradlew
+
+      # compile shadow fat jar with bundled dependencies
+      - name: Build shadow jar
+        if: steps.version_check.outputs.release_exists == 'false'
+        run: ./gradlew shadowJar --no-daemon
+
+      # compute sha256 checksum for binary integrity and security verification
+      - name: Generate sha256 checksum
+        if: steps.version_check.outputs.release_exists == 'false'
+        id: checksum
+        run: |
+          cd build/libs
+          JAR_FILE=$(ls demise-*.jar | head -n 1)
+          SHA256=$(sha256sum "$JAR_FILE" | awk '{print $1}')
+          echo "jar_file=$JAR_FILE" >> $GITHUB_OUTPUT
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "$SHA256 *$JAR_FILE" > checksum.sha256
+          echo "computed sha256: $SHA256"
+
+      # publish github release with compiled binaries and instructions
+      - name: Publish new version release
+        if: steps.version_check.outputs.release_exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Demise Client v${{ steps.version_check.outputs.version }}
+          tag_name: ${{ steps.version_check.outputs.tag }}
+          files: |
+            build/libs/*.jar
+            build/libs/checksum.sha256
+            json/demise.json
+          body: |
+            ### Automated Build Verification
+            * **Version**: `v${{ steps.version_check.outputs.version }}`
+            * **Binary**: `${{ steps.checksum.outputs.jar_file }}`
+            * **SHA-256**: `${{ steps.checksum.outputs.sha256 }}`
+            * **Source Repository**: `LaxentaInc/Demise-overruled`
+            * **Verification**: Compiled cleanly from source via GitHub Actions runner.
+
+            ---
+
+            ### Installation Instructions
+            1. Download `${{ steps.checksum.outputs.jar_file }}` and rename it to `demise.jar`.
+            2. Download `demise.json`.
+            3. Copy both files into your `.minecraft` directory:
+               * Windows path: `%appdata%\.minecraft\versions\demise\`
+               * Verify the files are named `demise.jar` and `demise.json`.
+            4. In your Minecraft launcher (Vanilla, HMCL, Prism, PojavLauncher):
+               * Select the `demise` version profile and launch.
